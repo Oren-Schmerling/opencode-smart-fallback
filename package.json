@@ -1,0 +1,27 @@
+{
+  "name": "opencode-smart-fallback",
+  "version": "1.0.0",
+  "description": "An advanced, zero-build model fallback router and primary agent manager for OpenCode.",
+  "main": "index.ts",
+  "type": "module",
+  "scripts": {
+    "test": "bun test index.test.ts"
+  },
+  "keywords": [
+    "opencode",
+    "ai",
+    "plugin",
+    "model-fallback",
+    "router",
+    "llm",
+    "bun"
+  ],
+  "author": "Oren Schmerling",
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.19.4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
