@@ -916,4 +916,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
   };
 };
 
-export default SmartFallbackPlugin;
+export default {
+  id: "model-fallback",
+  server: SmartFallbackPlugin,
+};
