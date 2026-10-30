@@ -68,6 +68,8 @@ interface SessionTrack {
   depth: number;
   activeModel?: string;
   agent: string;
+  parentID?: string;
+  isSubagent?: boolean;
   lastUserText?: string;
   lastUserMessageID?: string;
   recovering: boolean;
@@ -351,7 +353,11 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
     return null;
   };
 
-  const getOrInitSession = (sessionID: string, defaultAgent = "build"): SessionTrack => {
+  const getOrInitSession = (
+    sessionID: string,
+    defaultAgent = "build",
+    parentID?: string
+  ): SessionTrack => {
     lastActiveSessionID = sessionID;
     let s = sessions.get(sessionID);
     if (!s) {
@@ -363,8 +369,15 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
         activeModel: initialModel,
         recovering: false,
         history: [],
+        parentID,
+        isSubagent: Boolean(parentID) || !config.primaryAgents[defaultAgent],
       };
       sessions.set(sessionID, s);
+    } else {
+      if (parentID && !s.parentID) {
+        s.parentID = parentID;
+        s.isSubagent = true;
+      }
     }
     return s;
   };
@@ -527,6 +540,22 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
 
     try {
       quarantineModel(currentModel, reason, statusCode, undefined, s.agent);
+
+      const isSubagent = s.isSubagent || Boolean(s.parentID) || !config.primaryAgents[s.agent];
+      if (isSubagent) {
+        log({
+          event: "fallback.subagent.quarantined",
+          sessionID,
+          agent: s.agent,
+          from: currentModel,
+          detail: "Quarantined model for subagent without aborting/replaying child session",
+        });
+        await toast(
+          `⚠️ [Subagent: ${s.agent}] Model ${currentModel.split("/").pop()} failed. Quarantined for fallback.`,
+          "warning"
+        );
+        return;
+      }
 
       if (s.depth >= config.defaults.maxFallbackDepth) {
         log({
@@ -756,20 +785,23 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
         const headModel = resolveFirstHealthyModel(agentName);
         const headParsed = headModel ? splitModelKey(headModel) : null;
 
-        cfg.provider[hostProvider].models[lockID] = {
-          id: headParsed?.modelID ?? "gemini-3.8-flash-lite",
-          name: `🔒 Agent: ${agentName}`,
-          attachment: true,
-          reasoning: true,
-          temperature: true,
-          tool_call: true,
-          cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-          limit: { context: 200000, output: 64000 },
-        };
-
-        const existing = cfg.agent[agentName] ?? {};
         const useLocked =
           config.lockModelDropdownForPrimaryAgents && def.lockModelSelector !== false;
+
+        if (useLocked) {
+          cfg.provider[hostProvider].models[lockID] = {
+            id: headParsed?.modelID ?? "gemini-flash-lite-latest",
+            name: `🔒 Agent: ${agentName}`,
+            attachment: true,
+            reasoning: true,
+            temperature: true,
+            tool_call: true,
+            cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+            limit: { context: 200000, output: 64000 },
+          };
+        }
+
+        const existing = cfg.agent[agentName] ?? {};
 
         cfg.agent[agentName] = {
           ...existing,
@@ -815,10 +847,15 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
           Boolean(config.primaryAgents[activeAgent]) &&
           config.primaryAgents[activeAgent]?.lockModelSelector !== false);
 
-      if (isLockedPrimary || !requestedKey || !isUsable(requestedKey)) {
+      const policy = normalizeAgentPolicy(config, activeAgent);
+      const isNotInChain = Boolean(
+        requestedKey && policy.chain.length > 0 && !policy.chain.includes(requestedKey)
+      );
+
+      if (isLockedPrimary || !requestedKey || !isUsable(requestedKey) || isNotInChain) {
         const target = resolveFirstHealthyModel(
           activeAgent,
-          isLockedPrimary ? undefined : requestedKey
+          isLockedPrimary || isNotInChain ? undefined : requestedKey
         );
         if (target) {
           const parsed = splitModelKey(target);
@@ -829,6 +866,20 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
               input.model.modelID = parsed.modelID;
             }
             s.activeModel = target;
+
+            // Notify user when their manual model selection was overridden
+            const wasManualOverride =
+              isLockedPrimary &&
+              requestedKey &&
+              !isSyntheticAgentModel(requestedKey) &&
+              requestedKey !== target;
+            if (wasManualOverride) {
+              await toast(
+                `🔒 [${activeAgent}] Model locked — overrode ${requestedKey?.split("/").pop()} → ${target.split("/").pop()}`,
+                "warning"
+              );
+            }
+
             log({
               event: isLockedPrimary ? "agent.chain.route" : "preemptive.redirect",
               sessionID,
@@ -852,8 +903,16 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
       if (!config.enabled || !event) return;
 
       if (event.type === "session.created" || event.type === "session.updated") {
-        const sid = event.properties?.info?.id ?? event.properties?.sessionID;
-        if (sid) getOrInitSession(sid);
+        const info = event.properties?.info;
+        const sid = info?.id ?? event.properties?.sessionID;
+        if (sid) {
+          const s = getOrInitSession(sid, info?.agent ?? "build", info?.parentID);
+          if (info?.parentID) {
+            s.parentID = info.parentID;
+            s.isSubagent = true;
+          }
+          if (info?.agent) s.agent = info.agent;
+        }
       }
 
       if (event.type === "session.status") {

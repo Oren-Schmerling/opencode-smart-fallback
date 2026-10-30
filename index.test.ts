@@ -52,7 +52,7 @@ describe("Model Fallback & Primary Agent Lock Plugin", () => {
     expect(cmdOut.parts[0].text).not.toContain("No active fallback state for current session");
   });
 
-  test("config and chat.message rewrite google/agent-lock-plan to the first healthy model in plan's chain", async () => {
+  test("config sets true active model for primary agents when synthetic locking is disabled", async () => {
     const hooks = await SmartFallbackPlugin({
       client: {
         tui: { showToast: async () => ({}) },
@@ -73,14 +73,14 @@ describe("Model Fallback & Primary Agent Lock Plugin", () => {
     await hooks.config!(openCodeCfg);
 
     expect(openCodeCfg.agent.plan.mode).toBe("primary");
-    expect(openCodeCfg.agent.plan.model).toBe(`google/${LOCKED_MODEL_PREFIX}plan`);
-    expect(openCodeCfg.provider.google.models[`${LOCKED_MODEL_PREFIX}plan`].name).toBe("🔒 Agent: plan");
+    expect(openCodeCfg.agent.plan.model).toBe("openrouter/anthropic/claude-sonnet-5.5");
+    expect(openCodeCfg.provider.google.models[`${LOCKED_MODEL_PREFIX}plan`]).toBeUndefined();
 
     const output: any = {
       message: {
         id: "msg-1",
         agent: "plan",
-        model: { providerID: "google", modelID: `${LOCKED_MODEL_PREFIX}plan` },
+        model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet-5.5" },
       },
       parts: [{ type: "text", text: "Hello" }],
     };
@@ -89,14 +89,14 @@ describe("Model Fallback & Primary Agent Lock Plugin", () => {
         sessionID: "sess-1",
         agent: "plan",
         messageID: "msg-1",
-        model: { providerID: "google", modelID: `${LOCKED_MODEL_PREFIX}plan` },
+        model: { providerID: "openrouter", modelID: "anthropic/claude-sonnet-5.5" },
       } as any,
       output
     );
 
     expect(output.message.model).toEqual({
       providerID: "openrouter",
-      modelID: "~deepseek/deepseek-flash-latest",
+      modelID: "anthropic/claude-sonnet-5.5",
     });
   });
 });
