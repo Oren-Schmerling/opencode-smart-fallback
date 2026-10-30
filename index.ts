@@ -222,7 +222,7 @@ export function parseQuotaAndRetryMs(reason: string): {
   retryAfterMs?: number;
 } {
   const isHardQuota =
-    /free_tier_requests|requests per day|exceeded your current quota|billing details|insufficient_quota/i.test(
+    /free_tier_requests|requests per day|exceeded your current quota|billing details|insufficient_quota|freeusagelimiterror|free usage limit|opencode\.ai\/go/i.test(
       reason
     );
 
