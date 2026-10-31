@@ -32,7 +32,7 @@ Because OpenCode executes plugins directly using Bun, you can point your configu
    ```bash
    mkdir -p ~/.config/opencode/plugins
    cd ~/.config/opencode/plugins
-   git clone https://github.com/YOUR_GITHUB_USERNAME/opencode-smart-fallback.git model-fallback
+   git clone https://github.com/Oren-Schmerling/opencode-smart-fallback.git model-fallback
    ```
 
 2. **Register the plugin and command in `~/.config/opencode/opencode.jsonc`:**
@@ -40,7 +40,7 @@ Because OpenCode executes plugins directly using Bun, you can point your configu
    {
      "$schema": "https://opencode.ai/config.json",
      "plugin": [
-       "file:///home/YOUR_USER/.config/opencode/plugins/model-fallback/index.ts"
+       "file:///home/<your-user>/.config/opencode/plugins/model-fallback/index.ts"
      ],
      "command": {
        "fb": {

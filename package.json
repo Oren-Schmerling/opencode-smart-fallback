@@ -9,19 +9,34 @@
   },
   "keywords": [
     "opencode",
+    "opencode-plugin",
     "ai",
     "plugin",
     "model-fallback",
+    "fallback-chain",
+    "rate-limit",
+    "failover",
+    "model-routing",
     "router",
     "llm",
-    "bun"
+    "bun",
+    "typescript"
   ],
   "author": "Oren Schmerling",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Oren-Schmerling/opencode-smart-fallback.git"
+  },
+  "homepage": "https://github.com/Oren-Schmerling/opencode-smart-fallback#readme",
+  "bugs": {
+    "url": "https://github.com/Oren-Schmerling/opencode-smart-fallback/issues"
+  },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.19.4"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.19.4",
     "@types/bun": "latest"
   }
 }
