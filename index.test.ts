@@ -175,6 +175,11 @@ describe("Model Fallback Router Plugin", () => {
     });
   });
 
+  test("parseQuotaAndRetryMs treats timeout as hard failure requiring quota cooldown", () => {
+    const parsed = parseQuotaAndRetryMs("Timed out waiting for response headers");
+    expect(parsed.isHardQuota).toBe(true);
+  });
+
   test("plugin default export satisfies OpenCode v2 schema with id and setup", async () => {
     const { default: defaultExport, plugin } = await import("./index");
     expect(defaultExport).toBeDefined();
@@ -183,22 +188,65 @@ describe("Model Fallback Router Plugin", () => {
     expect(typeof defaultExport.server).toBe("function");
     expect(plugin).toBe(defaultExport);
 
+    let promptArgs: any;
+    let switchedAgent: any;
+    let switchedModel: any;
+
     // Verify setup runs without errors when given a v2 ctx
     const mockCtx: any = {
-      client: {
-        tui: { showToast: async () => ({}) },
-        session: {
-          messages: async () => ({ data: [] }),
-          abort: async () => ({}),
-          revert: async () => ({}),
-          promptAsync: async () => ({}),
+      session: {
+        context: async () => ({
+          data: [
+            { id: "msg-1", type: "user", text: "Hello from user" },
+            { id: "msg-2", type: "agent-switched", agent: "build" },
+          ],
+        }),
+        prompt: async (args: any) => {
+          promptArgs = args;
+          return { data: { id: "msg-3" } };
         },
+        switchAgent: async (args: any) => {
+          switchedAgent = args;
+        },
+        switchModel: async (args: any) => {
+          switchedModel = args;
+        },
+        hook: async () => {},
       },
-      event: { subscribe: (fn: any) => fn },
+      event: { subscribe: () => [] },
       command: { transform: async (fn: any) => fn({ add: () => {} }) },
       tool: { transform: async (fn: any) => fn({ add: () => {} }) },
     };
 
-    await expect(defaultExport.setup(mockCtx)).resolves.toBeUndefined();
+    let serverSetup: any;
+    const origServer = defaultExport.server;
+    (defaultExport as any).server = async (ctx: any, opts: any) => {
+      serverSetup = ctx;
+      return origServer(ctx, opts);
+    };
+
+    await defaultExport.setup(mockCtx);
+    expect(serverSetup).toBeDefined();
+
+    // Call promptAsync through the shim
+    await serverSetup.client.session.promptAsync({
+      path: { id: "sess-v2-1" },
+      body: {
+        agent: "build",
+        model: { providerID: "openrouter", modelID: "deepseek/deepseek-flash" },
+        parts: [{ type: "text", text: "Retry prompt" }],
+      },
+    });
+
+    expect(switchedAgent).toEqual({ sessionID: "sess-v2-1", agent: "build" });
+    expect(switchedModel).toEqual({
+      sessionID: "sess-v2-1",
+      model: { providerID: "openrouter", id: "deepseek/deepseek-flash" },
+    });
+    // Prompt must NOT include agents array with raw strings (avoids Expected Prompt.AgentAttachment)
+    expect(promptArgs).toEqual({ sessionID: "sess-v2-1", text: "Retry prompt" });
+
+    // Restore server
+    (defaultExport as any).server = origServer;
   });
 });

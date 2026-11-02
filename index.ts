@@ -224,7 +224,7 @@ export function parseQuotaAndRetryMs(reason: string): {
 
   const isHardQuota =
     !isRateLimit &&
-    /free_tier_requests|requests per day|exceeded your current quota|billing details|insufficient_quota|freeusagelimiterror|free usage limit|opencode\.ai\/go/i.test(
+    /free_tier_requests|requests per day|exceeded your current quota|billing details|insufficient_quota|freeusagelimiterror|free usage limit|opencode\.ai\/go|timed?\s*out|timeout|deadline_exceeded/i.test(
       reason
     );
 
@@ -436,11 +436,16 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         const msgs = Array.isArray(res.data) ? res.data : [];
         for (let i = msgs.length - 1; i >= 0; i--) {
           const info = (msgs[i] as any)?.info ?? msgs[i];
+          if ((info?.type === "user" || info?.role === "user") && (info.text || info.payload?.text) && !s.lastUserText) {
+            s.lastUserText = info.text || info.payload?.text;
+            s.lastUserMessageID = info.id;
+          }
           if (info?.agent) {
             s.agent = info.agent;
           }
-          if (info?.model?.providerID && info?.model?.modelID) {
-            const fullKey = `${info.model.providerID}/${info.model.modelID}`;
+          if (info?.model?.providerID && (info?.model?.modelID || info?.model?.id)) {
+            const mid = info.model.modelID ?? info.model.id;
+            const fullKey = `${info.model.providerID}/${mid}`;
             const lockedAgent = extractAgentFromSyntheticModel(fullKey);
             if (lockedAgent) {
               s.agent = lockedAgent;
@@ -521,8 +526,8 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           afterUser = true;
           continue;
         }
-        if (afterUser && (m.info?.role === "assistant" || m.role === "assistant")) {
-          const parts = m.parts ?? [];
+        if (afterUser && (m.info?.role === "assistant" || m.role === "assistant" || m.type === "assistant")) {
+          const parts = m.parts ?? m.content ?? [];
           if (
             parts.some(
               (p: any) =>
@@ -934,11 +939,15 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       if (
         event.type === "session.error" ||
         event.type === "session.next.step.failed" ||
+        event.type === "session.step.failed" ||
+        event.type === "session.execution.failed" ||
         (event.type === "session.idle" && event.properties?.outcome === "failed")
       ) {
-        const { sessionID } = event.properties ?? {};
-        if (!sessionID) return;
-        const errObj = event.properties?.error;
+        const sid =
+          event.properties?.sessionID ?? event.sessionID ?? event.data?.sessionID;
+        if (!sid) return;
+        const errObj =
+          event.properties?.error ?? event.error ?? event.data?.error;
         const errName = errObj?.name || "";
         const errMsg =
           errObj?.data?.message ||
@@ -947,7 +956,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         if (/abort|cancel/i.test(errName) || /abort|cancel/i.test(errMsg)) return;
 
         const statusCode = errObj?.data?.statusCode ?? errObj?.statusCode;
-        await triggerFallback(sessionID, errMsg, statusCode, undefined);
+        await triggerFallback(sid, errMsg, statusCode, undefined);
       }
     },
 
@@ -966,6 +975,43 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           text: `Output the following Markdown report verbatim with no extra commentary:\n\n${report}`,
         });
       }
+    },
+
+    "session.generate": async (payload: any) => {
+      if (!config.enabled || !payload?.model) return;
+      const providerID = payload.model.providerID;
+      const modelID = payload.model.id ?? payload.model.modelID;
+      if (!providerID || !modelID) return;
+      const currentKey = `${providerID}/${modelID}`;
+      if (isUsable(currentKey)) return;
+
+      const sid = payload.sessionID;
+      const s = await hydrateSession(sid);
+      const target = resolveFirstHealthyModel(s.agent, currentKey);
+      if (!target) return;
+      const parsed = splitModelKey(target);
+      if (!parsed) return;
+
+      payload.model.providerID = parsed.providerID;
+      payload.model.id = parsed.modelID;
+      if ("modelID" in payload.model) payload.model.modelID = parsed.modelID;
+      s.activeModel = target;
+
+      if (client?.session?.switchModel && sid) {
+        await client.session
+          .switchModel({
+            sessionID: sid,
+            model: { providerID: parsed.providerID, id: parsed.modelID },
+          })
+          .catch(() => {});
+      }
+      log({
+        event: "agent.chain.route",
+        sessionID: sid,
+        agent: s.agent,
+        from: currentKey,
+        to: target,
+      });
     },
 
     tool: {
@@ -992,13 +1038,20 @@ export const plugin = {
   setup: async (ctx: any) => {
     let hooks: any;
     try {
-      hooks = await SmartFallbackPlugin(
+      hooks = await (plugin.server ?? SmartFallbackPlugin)(
         {
           client: (ctx.client ?? {
             tui: { showToast: async () => ({}) },
             session: {
-              messages: async (p: any) =>
-                ctx.session?.messages ? ctx.session.messages(p) : { data: [] },
+              messages: async (p: any) => {
+                const sid = p.path?.id ?? p.sessionID;
+                if (ctx.session?.context) {
+                  const res = await ctx.session.context({ sessionID: sid }).catch(() => null);
+                  if (res?.data) return res;
+                  if (Array.isArray(res)) return { data: res };
+                }
+                return ctx.session?.messages ? ctx.session.messages(p) : { data: [] };
+              },
               abort: async (p: any) => {
                 const sid = p.path?.id ?? p.sessionID;
                 if (ctx.session?.interrupt) {
@@ -1007,6 +1060,13 @@ export const plugin = {
               },
               revert: async (p: any) =>
                 ctx.session?.revert ? ctx.session.revert(p) : ({}),
+              switchAgent: async (p: any) => {
+                const sid = p.path?.id ?? p.sessionID;
+                const agent = p.body?.agent ?? p.agent;
+                if (ctx.session?.switchAgent && agent) {
+                  await ctx.session.switchAgent({ sessionID: sid, agent }).catch(() => {});
+                }
+              },
               switchModel: async (p: any) => {
                 const sid = p.path?.id ?? p.sessionID;
                 const m = p.body?.model ?? p.model;
@@ -1023,6 +1083,11 @@ export const plugin = {
                   p.body?.parts?.find((part: any) => part.type === "text")?.text ||
                   p.body?.text ||
                   "Continue.";
+                if (p.body?.agent && ctx.session?.switchAgent) {
+                  await ctx.session
+                    .switchAgent({ sessionID: sid, agent: p.body.agent })
+                    .catch(() => {});
+                }
                 if (p.body?.model && ctx.session?.switchModel) {
                   await ctx.session
                     .switchModel({
@@ -1038,7 +1103,6 @@ export const plugin = {
                   return await ctx.session.prompt({
                     sessionID: sid,
                     text,
-                    ...(p.body?.agent ? { agents: [p.body.agent] } : {}),
                   });
                 }
               },
@@ -1097,6 +1161,15 @@ export const plugin = {
               } as any,
             });
           }
+        });
+      } catch {}
+    }
+
+    // Preemptive generation hook: route away from quarantined models before model call
+    if (ctx.session?.hook && hooks["session.generate"]) {
+      try {
+        await ctx.session.hook("generate", async (payload: any) => {
+          await hooks["session.generate"](payload);
         });
       } catch {}
     }
