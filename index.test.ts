@@ -25,19 +25,20 @@ describe("Model Fallback Router Plugin", () => {
     expect(result.retryAfterMs).toBe(19861956);
   });
 
-  test("parseQuotaAndRetryMs treats per-minute token quota as a transient rate limit", () => {
+  test("parseQuotaAndRetryMs treats Free Tier quota exhaustion as hard quota", () => {
     const errorMsg =
       "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 250000, model: gemini-3.5-flash-lite, description: Generate content input tokens per minute limit exceeded on Free Tier. \nPlease retry in 10.099206206s.";
     const result = parseQuotaAndRetryMs(errorMsg);
-    expect(result.isHardQuota).toBe(false);
-    expect(result.isRateLimit).toBe(true);
+    expect(result.isHardQuota).toBe(true);
     expect(result.retryAfterMs).toBe(10100);
   });
 
   test("computeQuarantine enforces a minimum cooldown for per-minute rate limits", () => {
     const parsed = parseQuotaAndRetryMs(
-      "Generate content input tokens per minute limit exceeded on Free Tier. Please retry in 2.5s."
+      "Generate content input tokens per minute limit exceeded. Please retry in 2.5s."
     );
+    expect(parsed.isHardQuota).toBe(false);
+    expect(parsed.isRateLimit).toBe(true);
     const { duration, state } = computeQuarantine(parsed, undefined, parsed.retryAfterMs!, {
       cooldownMs: 60_000,
       quotaCooldownMs: 1_800_000,
@@ -340,10 +341,39 @@ describe("Model Fallback Router Plugin", () => {
       expect.objectContaining({
         providerID: "openrouter",
         id: "openrouter/free",
-        modelID: "openrouter/free",
       })
     );
     expect(prompted).toBeDefined();
     expect(prompted.sessionID).toBe("sub-ses-1");
+
+    // A brand new subagent session created after Gemini is quarantined must be
+    // preemptively routed to openrouter/free before its first request
+    let sub2SwitchedModel: any;
+    const sub2MsgOut: any = {
+      message: {
+        id: "msg-user-2",
+        agent: "scout",
+        model: { providerID: "google", modelID: "gemini-flash-lite-latest" },
+      },
+      parts: [{ type: "text", text: "New subagent task" }],
+    };
+
+    await hooks["chat.message"]!(
+      {
+        sessionID: "sub-ses-2",
+        agent: "scout",
+        messageID: "msg-user-2",
+        model: { providerID: "google", modelID: "gemini-flash-lite-latest" },
+      } as any,
+      sub2MsgOut
+    );
+
+    expect(sub2MsgOut.message.model).toEqual(
+      expect.objectContaining({
+        providerID: "openrouter",
+        id: "openrouter/free",
+      })
+    );
   });
 });
+

@@ -94,7 +94,7 @@ const DEFAULT_CONFIG: FallbackConfig = {
   defaults: {
     retriesBeforeFallback: 0,
     quarantineAfterFallbackMs: 14_400_000,
-    cooldownMs: 60_000,
+    cooldownMs: 1_800_000,
     quotaCooldownMs: 14_400_000,
     maxFallbackDepth: 4,
     strategy: "auto",
@@ -221,17 +221,17 @@ export function parseQuotaAndRetryMs(reason: string): {
   isRateLimit: boolean;
   retryAfterMs?: number;
 } {
-  // Per-minute / rolling-window limits are transient. Google phrases these as
-  // "You exceeded your current quota", so they must be detected *before* the
-  // hard-quota regex or they get quarantined for only the tiny retry-after
-  // (often 2-10s) and are immediately re-selected by the next subagent.
-  const isRateLimit = /per minute|per_minute|tokens per minute|rate.?limit/i.test(reason);
-
+  // Hard/daily quotas and billing limits take precedence over transient rate limits.
+  // Google Gemini Free Tier errors often mention "per minute" while indicating
+  // free tier exhaustion ("exceeded your current quota", "free_tier", etc.).
   const isHardQuota =
-    !isRateLimit &&
-    /free_tier_requests|requests per day|exceeded your current quota|billing details|insufficient_quota|freeusagelimiterror|free usage limit|opencode\.ai\/go|timed?\s*out|timeout|deadline_exceeded/i.test(
+    /free_tier|free.?tier|requests per day|exceeded your current quota|billing details|insufficient_quota|freeusagelimiterror|free usage limit|opencode\.ai\/go|timed?\s*out|timeout|deadline_exceeded/i.test(
       reason
     );
+
+  const isRateLimit =
+    !isHardQuota &&
+    /per minute|per_minute|tokens per minute|rate.?limit/i.test(reason);
 
   // Match patterns like "retry in 5h31m1.95s", "retry in 42m10s", "retry in 35.5s"
   const retryMatch = reason.match(
@@ -283,6 +283,10 @@ export function computeQuarantine(
     state = "cooldown";
   }
 
+  if (parsedQuota.retryAfterMs && parsedQuota.retryAfterMs > duration) {
+    duration = parsedQuota.retryAfterMs;
+  }
+
   return { duration, state };
 }
 
@@ -321,6 +325,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
   const health = new Map<string, ModelHealthEntry>();
   const sessions = new Map<string, SessionTrack>();
   const ringBuffer: LogEvent[] = [];
+  const recoveringSessions = new Set<string>();
   let lastActiveSessionID: string | undefined;
 
   mkdirSync(dirname(config.logPath), { recursive: true });
@@ -344,7 +349,12 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       const now = Date.now();
       health.clear();
       for (const [k, v] of Object.entries(data)) {
-        if (v.until > now) health.set(k, v);
+        if (v.state === "retired" || v.until > now) {
+          health.set(k, {
+            ...v,
+            until: v.state === "retired" ? Number.POSITIVE_INFINITY : v.until,
+          });
+        }
       }
     } catch {}
   };
@@ -354,7 +364,12 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       const now = Date.now();
       const out: Record<string, ModelHealthEntry> = {};
       for (const [k, v] of health.entries()) {
-        if (v.until > now && Number.isFinite(v.until)) out[k] = v;
+        if (v.state === "retired" || v.until > now) {
+          out[k] = {
+            ...v,
+            until: Number.isFinite(v.until) ? v.until : 9_999_999_999_999,
+          };
+        }
       }
       writeFileSync(config.statePath, JSON.stringify(out, null, 2));
     } catch {}
@@ -502,7 +517,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       parsedQuota,
       statusCode,
       baseDuration,
-      config.defaults
+      getConfig().defaults
     );
 
     if (duration <= 0) return;
@@ -565,11 +580,21 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
     statusCode?: number,
     attempt?: number
   ) => {
+    if (!sessionID || recoveringSessions.has(sessionID)) return;
+    if (/abort|cancel|interrupt/i.test(reason)) return;
+    recoveringSessions.add(sessionID);
+
     const s = await hydrateSession(sessionID);
-    if (s.recovering) return;
+    if (s.recovering) {
+      setTimeout(() => recoveringSessions.delete(sessionID), 2000);
+      return;
+    }
 
     const currentModel = s.activeModel ?? resolveFirstHealthyModel(s.agent);
-    if (!currentModel) return;
+    if (!currentModel) {
+      setTimeout(() => recoveringSessions.delete(sessionID), 2000);
+      return;
+    }
 
     const policy = normalizeAgentPolicy(getConfig(), s.agent);
     const parsedQuota = parseQuotaAndRetryMs(reason);
@@ -593,6 +618,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         `⏳ [${s.agent}] Retry ${attempt}/${policy.retriesBeforeFallback} on ${currentModel}`,
         "info"
       );
+      setTimeout(() => recoveringSessions.delete(sessionID), 2000);
       return;
     }
 
@@ -743,6 +769,9 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       if (s.epoch === myEpoch) {
         s.recovering = false;
       }
+      setTimeout(() => {
+        recoveringSessions.delete(sessionID);
+      }, 3000);
     }
   };
 
@@ -867,13 +896,24 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           model: headModel ?? existing.model ?? undefined,
         };
       }
+
+      // Preemptively update subagents and any configured agents if their model is quarantined
+      for (const [agentName, existing] of Object.entries(cfg.agent as Record<string, any>)) {
+        if (existing?.model && !isUsable(existing.model)) {
+          const healthy = resolveFirstHealthyModel(agentName, existing.model);
+          if (healthy) {
+            existing.model = healthy;
+          }
+        }
+      }
     },
 
     "chat.message": async (input: any, output: any) => {
       if (!config.enabled) return;
       const sessionID = input.sessionID;
-      const requestedKey = input.model
-        ? `${input.model.providerID}/${input.model.modelID}`
+      const inputModel = input.model ?? output?.message?.model;
+      const requestedKey = inputModel
+        ? `${inputModel.providerID}/${inputModel.modelID ?? inputModel.id}`
         : undefined;
 
       const syntheticAgent = extractAgentFromSyntheticModel(requestedKey);
@@ -905,13 +945,25 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         );
         if (target) {
           const parsed = splitModelKey(target);
-          if (parsed && output?.message) {
-            output.message.model = parsed;
+          if (parsed) {
+            if (output?.message) output.message.model = parsed;
             if (input.model) {
               input.model.providerID = parsed.providerID;
               input.model.modelID = parsed.modelID;
+              input.model.id = parsed.modelID;
             }
             s.activeModel = target;
+
+            if (client?.session?.switchModel && sessionID) {
+              await client.session
+                .switchModel({
+                  sessionID,
+                  model: parsed,
+                  path: { sessionID, id: sessionID },
+                  body: { model: parsed },
+                })
+                .catch(() => {});
+            }
 
             log({
               event: "agent.chain.route",
@@ -996,6 +1048,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           event.properties?.error?.message ||
           event.properties?.message ||
           "Provider retry triggered";
+        if (/abort|cancel|interrupt/i.test(msg)) return;
         const codeMatch = msg.match(/\b(402|404|408|409|410|426|429|500|502|503|504|529)\b/);
         const statusCode = codeMatch ? Number(codeMatch[1]) : undefined;
         await triggerFallback(sessionID, msg, statusCode, attempt);
@@ -1018,7 +1071,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           errObj?.data?.message ||
           errObj?.message ||
           (typeof errObj === "string" ? errObj : JSON.stringify(errObj || "Session failed"));
-        if (/abort|cancel/i.test(errName) || /abort|cancel/i.test(errMsg)) return;
+        if (/abort|cancel|interrupt/i.test(errName) || /abort|cancel|interrupt/i.test(errMsg)) return;
 
         const statusCode = errObj?.data?.statusCode ?? errObj?.statusCode;
         await triggerFallback(sid, errMsg, statusCode, undefined);
@@ -1111,95 +1164,141 @@ export const plugin = {
             tui: ctx.client?.tui ?? { showToast: async () => ({}) },
             session: {
               messages: async (p: any) => {
-                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
+                const sid = p.sessionID ?? p.path?.sessionID ?? p.path?.id ?? p.id;
                 if (ctx.session?.context) {
                   const res = await ctx.session.context({ sessionID: sid }).catch(() => null);
                   if (res?.data) return res;
                   if (Array.isArray(res)) return { data: res };
                 }
+                if (ctx.client?.session?.context) {
+                  const res = await ctx.client.session.context({ sessionID: sid, path: { sessionID: sid, id: sid } }).catch(() => null);
+                  if (res?.data) return res;
+                  if (Array.isArray(res)) return { data: res };
+                }
                 if (ctx.client?.session?.messages) {
-                  return await ctx.client.session.messages({ path: { sessionID: sid, id: sid } }).catch(() => ({ data: [] }));
+                  return await ctx.client.session.messages({ sessionID: sid, id: sid, path: { sessionID: sid, id: sid } }).catch(() => ({ data: [] }));
                 }
                 if (ctx.client?.session?.message?.list) {
-                  return await ctx.client.session.message.list({ path: { sessionID: sid } }).catch(() => ({ data: [] }));
+                  return await ctx.client.session.message.list({ sessionID: sid, path: { sessionID: sid, id: sid } }).catch(() => ({ data: [] }));
                 }
                 return { data: [] };
               },
               abort: async (p: any) => {
-                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
+                const sid = p.sessionID ?? p.path?.sessionID ?? p.path?.id ?? p.id;
                 if (ctx.session?.interrupt) {
                   await ctx.session.interrupt({ sessionID: sid }).catch(() => {});
                 }
                 if (ctx.client?.session?.interrupt) {
-                  await ctx.client.session.interrupt({ path: { sessionID: sid } }).catch(() => {});
+                  await ctx.client.session.interrupt({ sessionID: sid, path: { sessionID: sid, id: sid } }).catch(() => {});
                 } else if (ctx.client?.session?.abort) {
-                  await ctx.client.session.abort({ path: { sessionID: sid, id: sid } }).catch(() => {});
+                  await ctx.client.session.abort({ sessionID: sid, id: sid, path: { sessionID: sid, id: sid } }).catch(() => {});
                 }
               },
               revert: async (p: any) => {
-                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
-                const messageID = p.body?.messageID ?? p.messageID;
+                const sid = p.sessionID ?? p.path?.sessionID ?? p.path?.id ?? p.id;
+                const messageID = p.messageID ?? p.body?.messageID;
                 if (ctx.session?.revert) {
                   return await ctx.session.revert({ sessionID: sid, messageID }).catch(() => ({}));
                 }
                 if (ctx.client?.session?.revert?.stage) {
-                  return await ctx.client.session.revert.stage({ path: { sessionID: sid }, body: { messageID } }).catch(() => ({}));
+                  return await ctx.client.session.revert.stage({
+                    sessionID: sid,
+                    messageID,
+                    path: { sessionID: sid, id: sid },
+                    body: { messageID },
+                  }).catch(() => ({}));
+                }
+                if (ctx.client?.session?.revert) {
+                  return await ctx.client.session.revert({
+                    sessionID: sid,
+                    messageID,
+                    path: { sessionID: sid, id: sid },
+                    body: { messageID },
+                  }).catch(() => ({}));
                 }
                 return {};
               },
               switchAgent: async (p: any) => {
-                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
-                const agent = p.body?.agent ?? p.agent;
+                const sid = p.sessionID ?? p.path?.sessionID ?? p.path?.id ?? p.id;
+                const agent = p.agent ?? p.body?.agent;
                 if (ctx.session?.switchAgent && agent) {
                   await ctx.session.switchAgent({ sessionID: sid, agent }).catch(() => {});
                 }
                 if (ctx.client?.session?.switchAgent && agent) {
-                  await ctx.client.session.switchAgent({ path: { sessionID: sid }, body: { agent } }).catch(() => {});
+                  await ctx.client.session.switchAgent({
+                    sessionID: sid,
+                    agent,
+                    path: { sessionID: sid, id: sid },
+                    body: { agent },
+                  }).catch(() => {});
                 }
               },
               switchModel: async (p: any) => {
-                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
-                const m = p.body?.model ?? p.model;
+                const sid = p.sessionID ?? p.path?.sessionID ?? p.path?.id ?? p.id;
+                const m = p.model ?? p.body?.model;
                 if (!m) return;
                 const parsed = { providerID: m.providerID, id: m.id ?? m.modelID };
                 if (ctx.session?.switchModel) {
                   await ctx.session.switchModel({ sessionID: sid, model: parsed }).catch(() => {});
                 }
                 if (ctx.client?.session?.switchModel) {
-                  await ctx.client.session.switchModel({ path: { sessionID: sid }, body: { model: parsed } }).catch(() => {});
+                  await ctx.client.session.switchModel({
+                    sessionID: sid,
+                    model: parsed,
+                    path: { sessionID: sid, id: sid },
+                    body: { model: parsed },
+                  }).catch(() => {});
                 }
               },
               promptAsync: async (p: any) => {
-                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
+                const sid = p.sessionID ?? p.path?.sessionID ?? p.path?.id ?? p.id;
                 const text =
                   p.body?.text ??
                   p.text ??
+                  p.prompt?.text ??
+                  (typeof p.prompt === "string" ? p.prompt : undefined) ??
                   p.body?.parts?.find((part: any) => part.type === "text")?.text ??
                   "Continue.";
-                const agent = p.body?.agent ?? p.agent;
+                const agent = p.agent ?? p.body?.agent;
                 if (agent) {
                   if (ctx.session?.switchAgent) {
                     await ctx.session.switchAgent({ sessionID: sid, agent }).catch(() => {});
                   }
                   if (ctx.client?.session?.switchAgent) {
-                    await ctx.client.session.switchAgent({ path: { sessionID: sid }, body: { agent } }).catch(() => {});
+                    await ctx.client.session.switchAgent({
+                      sessionID: sid,
+                      agent,
+                      path: { sessionID: sid, id: sid },
+                      body: { agent },
+                    }).catch(() => {});
                   }
                 }
-                const m = p.body?.model ?? p.model;
+                const m = p.model ?? p.body?.model;
                 if (m) {
                   const parsed = { providerID: m.providerID, id: m.id ?? m.modelID };
                   if (ctx.session?.switchModel) {
                     await ctx.session.switchModel({ sessionID: sid, model: parsed }).catch(() => {});
                   }
                   if (ctx.client?.session?.switchModel) {
-                    await ctx.client.session.switchModel({ path: { sessionID: sid }, body: { model: parsed } }).catch(() => {});
+                    await ctx.client.session.switchModel({
+                      sessionID: sid,
+                      model: parsed,
+                      path: { sessionID: sid, id: sid },
+                      body: { model: parsed },
+                    }).catch(() => {});
                   }
                 }
                 if (ctx.session?.prompt) {
                   return await ctx.session.prompt({ sessionID: sid, text });
                 }
                 if (ctx.client?.session?.prompt) {
-                  return await ctx.client.session.prompt({ path: { sessionID: sid }, body: { text } });
+                  return await ctx.client.session.prompt({
+                    sessionID: sid,
+                    prompt: { text },
+                    text,
+                    path: { sessionID: sid, id: sid },
+                    body: { text, parts: [{ type: "text", text }] },
+                  });
                 }
               },
             },
