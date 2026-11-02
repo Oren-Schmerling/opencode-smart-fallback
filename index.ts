@@ -28,8 +28,6 @@ export type AgentChainConfig = string[] | AgentChainObject;
 
 export interface FallbackConfig {
   enabled: boolean;
-  lockModelDropdownForPrimaryAgents: boolean;
-  hostProviderForLockedModels: string;
   defaults: {
     retriesBeforeFallback: number;
     quarantineAfterFallbackMs: number;
@@ -45,6 +43,8 @@ export interface FallbackConfig {
   agents: Record<string, AgentChainConfig>;
   logPath: string;
   statePath: string;
+  lockModelDropdownForPrimaryAgents?: boolean;
+  hostProviderForLockedModels?: string;
 }
 
 interface NormalizedAgentPolicy {
@@ -91,13 +91,11 @@ interface LogEvent {
 
 const DEFAULT_CONFIG: FallbackConfig = {
   enabled: true,
-  lockModelDropdownForPrimaryAgents: true,
-  hostProviderForLockedModels: "google",
   defaults: {
     retriesBeforeFallback: 0,
-    quarantineAfterFallbackMs: 120_000,
+    quarantineAfterFallbackMs: 14_400_000,
     cooldownMs: 60_000,
-    quotaCooldownMs: 1_800_000,
+    quotaCooldownMs: 14_400_000,
     maxFallbackDepth: 4,
     strategy: "auto",
     abortTimeoutMs: 15_000,
@@ -108,22 +106,18 @@ const DEFAULT_CONFIG: FallbackConfig = {
     plan: {
       description: "Architecture & planning primary agent (read-only orchestration)",
       temperature: 0.2,
-      lockModelSelector: true,
     },
     build: {
       description: "Full-access implementation primary agent with automatic model failover",
       temperature: 0.1,
-      lockModelSelector: true,
     },
     "deep-review": {
       description: "High-reasoning code review & security audit primary agent",
       temperature: 0.1,
-      lockModelSelector: true,
     },
     "fast-patch": {
       description: "Low-latency surgical editing primary agent on fast flash tiers",
       temperature: 0.0,
-      lockModelSelector: true,
     },
   },
   agents: {
@@ -219,9 +213,17 @@ export function extractAgentFromSyntheticModel(modelKey?: string): string | null
  */
 export function parseQuotaAndRetryMs(reason: string): {
   isHardQuota: boolean;
+  isRateLimit: boolean;
   retryAfterMs?: number;
 } {
+  // Per-minute / rolling-window limits are transient. Google phrases these as
+  // "You exceeded your current quota", so they must be detected *before* the
+  // hard-quota regex or they get quarantined for only the tiny retry-after
+  // (often 2-10s) and are immediately re-selected by the next subagent.
+  const isRateLimit = /per minute|per_minute|tokens per minute|rate.?limit/i.test(reason);
+
   const isHardQuota =
+    !isRateLimit &&
     /free_tier_requests|requests per day|exceeded your current quota|billing details|insufficient_quota|freeusagelimiterror|free usage limit|opencode\.ai\/go/i.test(
       reason
     );
@@ -236,11 +238,47 @@ export function parseQuotaAndRetryMs(reason: string): {
     const secs = Number(retryMatch[3] || 0);
     const totalMs = Math.ceil((hours * 3600 + mins * 60 + secs) * 1000);
     if (totalMs > 0) {
-      return { isHardQuota: isHardQuota || totalMs >= 300_000, retryAfterMs: totalMs };
+      return {
+        isHardQuota: isHardQuota || totalMs >= 300_000,
+        isRateLimit,
+        retryAfterMs: totalMs,
+      };
     }
   }
 
-  return { isHardQuota };
+  return { isHardQuota, isRateLimit };
+}
+
+/**
+ * Computes how long a model should be quarantined and in which state.
+ * Hard/daily quotas always get at least `quotaCooldownMs`; transient
+ * per-minute rate limits always get at least `cooldownMs`. This prevents a
+ * provider's short "retry in Ns" hint from un-quarantining a dead model
+ * before the next subagent is spawned.
+ */
+export function computeQuarantine(
+  parsedQuota: { isHardQuota: boolean; isRateLimit: boolean; retryAfterMs?: number },
+  statusCode: number | undefined,
+  baseDurationMs: number,
+  defaults: { cooldownMs: number; quotaCooldownMs: number }
+): { duration: number; state: ModelHealthEntry["state"] } {
+  let duration = baseDurationMs;
+  let state: ModelHealthEntry["state"] = "quarantined";
+
+  if (statusCode === 410 || statusCode === 404) {
+    duration = Number.POSITIVE_INFINITY;
+    state = "retired";
+  } else if (statusCode === 402 || statusCode === 426 || parsedQuota.isHardQuota) {
+    // 426 Upgrade Required means the tier is blocked until the account is
+    // upgraded, so keep it out of rotation for the full quota cooldown.
+    duration = Math.max(duration, defaults.quotaCooldownMs);
+    state = "quota_exhausted";
+  } else if (statusCode === 429 || parsedQuota.isRateLimit) {
+    duration = Math.max(duration, defaults.cooldownMs);
+    state = "cooldown";
+  }
+
+  return { duration, state };
 }
 
 function formatDuration(ms: number): string {
@@ -266,8 +304,15 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
   }
 }
 
-export const SmartFallbackPlugin: Plugin = async ({ client }) => {
-  const config = loadConfig();
+export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
+  const fileConfig = loadConfig();
+  const config: FallbackConfig = {
+    ...fileConfig,
+    ...(options as any),
+    defaults: { ...fileConfig.defaults, ...((options as any)?.defaults ?? {}) },
+    primaryAgents: { ...fileConfig.primaryAgents, ...((options as any)?.primaryAgents ?? {}) },
+    agents: { ...fileConfig.agents, ...((options as any)?.agents ?? {}) },
+  };
   const health = new Map<string, ModelHealthEntry>();
   const sessions = new Map<string, SessionTrack>();
   const ringBuffer: LogEvent[] = [];
@@ -427,22 +472,16 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
     const prev = health.get(modelKey);
     const parsedQuota = parseQuotaAndRetryMs(reason);
 
-    let duration =
+    const baseDuration =
       customDurationMs ??
       parsedQuota.retryAfterMs ??
       policy.quarantineAfterFallbackMs;
-    let state: ModelHealthEntry["state"] = "quarantined";
-
-    if (statusCode === 410 || statusCode === 404) {
-      duration = Number.POSITIVE_INFINITY;
-      state = "retired";
-    } else if (statusCode === 402 || parsedQuota.isHardQuota) {
-      duration = Math.max(duration, parsedQuota.retryAfterMs ?? config.defaults.quotaCooldownMs);
-      state = "quota_exhausted";
-    } else if (statusCode === 429) {
-      duration = Math.max(duration, config.defaults.cooldownMs);
-      state = "cooldown";
-    }
+    const { duration, state } = computeQuarantine(
+      parsedQuota,
+      statusCode,
+      baseDuration,
+      config.defaults
+    );
 
     if (duration <= 0) return;
 
@@ -714,7 +753,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
     const agentRows = Object.keys(config.agents)
       .map((agentKey) => {
         const pol = normalizeAgentPolicy(config, agentKey);
-        const modeLabel = config.primaryAgents[agentKey] ? "Primary (Locked UI)" : "Subagent / Rule";
+        const modeLabel = config.primaryAgents[agentKey] ? "Primary" : "Subagent / Rule";
         const activeHead = resolveFirstHealthyModel(agentKey) ?? "_EXHAUSTED_";
         const marker = agentKey === s.agent ? "👉 " : "";
         return `| ${marker}\`${agentKey}\` | ${modeLabel} | \`${activeHead}\` | \`${pol.strategy}\` | \`${pol.retriesBeforeFallback}\` | ${pol.chain.map((m) => `\`${m.split("/").pop()}\``).join(" → ")} |`;
@@ -774,33 +813,9 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
     config: async (cfg: any) => {
       if (!config.enabled) return;
       cfg.agent = cfg.agent ?? {};
-      cfg.provider = cfg.provider ?? {};
-
-      const hostProvider = config.hostProviderForLockedModels || "google";
-      cfg.provider[hostProvider] = cfg.provider[hostProvider] ?? {};
-      cfg.provider[hostProvider].models = cfg.provider[hostProvider].models ?? {};
 
       for (const [agentName, def] of Object.entries(config.primaryAgents)) {
-        const lockID = `${LOCKED_MODEL_PREFIX}${agentName}`;
         const headModel = resolveFirstHealthyModel(agentName);
-        const headParsed = headModel ? splitModelKey(headModel) : null;
-
-        const useLocked =
-          config.lockModelDropdownForPrimaryAgents && def.lockModelSelector !== false;
-
-        if (useLocked) {
-          cfg.provider[hostProvider].models[lockID] = {
-            id: headParsed?.modelID ?? "gemini-flash-lite-latest",
-            name: `🔒 Agent: ${agentName}`,
-            attachment: true,
-            reasoning: true,
-            temperature: true,
-            tool_call: true,
-            cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
-            limit: { context: 200000, output: 64000 },
-          };
-        }
-
         const existing = cfg.agent[agentName] ?? {};
 
         cfg.agent[agentName] = {
@@ -811,9 +826,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
           ...(typeof def.temperature === "number" ? { temperature: def.temperature } : {}),
           ...(def.prompt ? { prompt: def.prompt } : {}),
           ...(def.tools ? { tools: { ...(existing.tools ?? {}), ...def.tools } } : {}),
-          model: useLocked
-            ? `${hostProvider}/${lockID}`
-            : existing.model ?? headModel ?? undefined,
+          model: headModel ?? existing.model ?? undefined,
         };
       }
     },
@@ -841,21 +854,16 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
         s.depth = 0;
       }
 
-      const isLockedPrimary =
-        isSyntheticAgentModel(requestedKey) ||
-        (config.lockModelDropdownForPrimaryAgents &&
-          Boolean(config.primaryAgents[activeAgent]) &&
-          config.primaryAgents[activeAgent]?.lockModelSelector !== false);
-
+      const isLegacySynthetic = isSyntheticAgentModel(requestedKey);
       const policy = normalizeAgentPolicy(config, activeAgent);
       const isNotInChain = Boolean(
         requestedKey && policy.chain.length > 0 && !policy.chain.includes(requestedKey)
       );
 
-      if (isLockedPrimary || !requestedKey || !isUsable(requestedKey) || isNotInChain) {
+      if (isLegacySynthetic || !requestedKey || !isUsable(requestedKey) || isNotInChain) {
         const target = resolveFirstHealthyModel(
           activeAgent,
-          isLockedPrimary || isNotInChain ? undefined : requestedKey
+          isLegacySynthetic || isNotInChain ? undefined : requestedKey
         );
         if (target) {
           const parsed = splitModelKey(target);
@@ -867,26 +875,11 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
             }
             s.activeModel = target;
 
-            // Notify user when their manual model selection was overridden
-            const wasManualOverride =
-              isLockedPrimary &&
-              requestedKey &&
-              !isSyntheticAgentModel(requestedKey) &&
-              requestedKey !== target;
-            if (wasManualOverride) {
-              await toast(
-                `🔒 [${activeAgent}] Model locked — overrode ${requestedKey?.split("/").pop()} → ${target.split("/").pop()}`,
-                "warning"
-              );
-            }
-
             log({
-              event: isLockedPrimary ? "agent.chain.route" : "preemptive.redirect",
+              event: "agent.chain.route",
               sessionID,
               agent: activeAgent,
-              from:
-                requestedKey ??
-                `${config.hostProviderForLockedModels}/${LOCKED_MODEL_PREFIX}${activeAgent}`,
+              from: requestedKey ?? target,
               to: target,
             });
             return;
@@ -921,7 +914,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }) => {
         if (sessionID && status?.type === "retry") {
           const attempt = typeof status.attempt === "number" ? status.attempt : undefined;
           const msg = status.message || "Provider retry triggered";
-          const codeMatch = msg.match(/\b(402|404|408|409|410|429|500|502|503|504|529)\b/);
+          const codeMatch = msg.match(/\b(402|404|408|409|410|426|429|500|502|503|504|529)\b/);
           const statusCode = codeMatch ? Number(codeMatch[1]) : undefined;
           await triggerFallback(sessionID, msg, statusCode, attempt);
         }

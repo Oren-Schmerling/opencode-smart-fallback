@@ -3,12 +3,13 @@ import {
   MODEL_KEY_REGEX,
   LOCKED_MODEL_PREFIX,
   parseQuotaAndRetryMs,
+  computeQuarantine,
   normalizeAgentPolicy,
   loadConfig,
   SmartFallbackPlugin,
 } from "./index";
 
-describe("Model Fallback & Primary Agent Lock Plugin", () => {
+describe("Model Fallback Router Plugin", () => {
   test("accepts relaxed model keys", () => {
     expect(MODEL_KEY_REGEX.test("openrouter/~deepseek/deepseek-flash-latest")).toBe(true);
     expect(MODEL_KEY_REGEX.test("google/gemini-3.8-flash")).toBe(true);
@@ -22,6 +23,73 @@ describe("Model Fallback & Primary Agent Lock Plugin", () => {
     expect(result.retryAfterMs).toBeDefined();
     // 5h 31m 1.955s -> 5 * 3600 + 31 * 60 + 1.955150363 = 19861.95515s = ~19861956 ms
     expect(result.retryAfterMs).toBe(19861956);
+  });
+
+  test("parseQuotaAndRetryMs treats per-minute token quota as a transient rate limit", () => {
+    const errorMsg =
+      "You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. \n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_input_token_count, limit: 250000, model: gemini-3.5-flash-lite, description: Generate content input tokens per minute limit exceeded on Free Tier. \nPlease retry in 10.099206206s.";
+    const result = parseQuotaAndRetryMs(errorMsg);
+    expect(result.isHardQuota).toBe(false);
+    expect(result.isRateLimit).toBe(true);
+    expect(result.retryAfterMs).toBe(10100);
+  });
+
+  test("computeQuarantine enforces a minimum cooldown for per-minute rate limits", () => {
+    const parsed = parseQuotaAndRetryMs(
+      "Generate content input tokens per minute limit exceeded on Free Tier. Please retry in 2.5s."
+    );
+    const { duration, state } = computeQuarantine(parsed, undefined, parsed.retryAfterMs!, {
+      cooldownMs: 60_000,
+      quotaCooldownMs: 1_800_000,
+    });
+    // A 2.5s provider hint must not un-quarantine the model before the next subagent.
+    expect(duration).toBe(60_000);
+    expect(state).toBe("cooldown");
+  });
+
+  test("computeQuarantine enforces the quota cooldown for hard quotas even with a short retry hint", () => {
+    const parsed = parseQuotaAndRetryMs(
+      "You exceeded your current quota, please check your plan and billing details. Please retry in 2s."
+    );
+    const { duration, state } = computeQuarantine(parsed, undefined, parsed.retryAfterMs!, {
+      cooldownMs: 60_000,
+      quotaCooldownMs: 1_800_000,
+    });
+    expect(duration).toBe(1_800_000);
+    expect(state).toBe("quota_exhausted");
+  });
+
+  test("computeQuarantine honors a long provider retry-after over the quota cooldown", () => {
+    const parsed = parseQuotaAndRetryMs(
+      "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20. Please retry in 5h31m1.955150363s."
+    );
+    const { duration, state } = computeQuarantine(parsed, undefined, parsed.retryAfterMs!, {
+      cooldownMs: 60_000,
+      quotaCooldownMs: 1_800_000,
+    });
+    expect(duration).toBe(19_861_956);
+    expect(state).toBe("quota_exhausted");
+  });
+
+  test("computeQuarantine uses the fallback quarantine for unknown errors with no timer", () => {
+    const parsed = parseQuotaAndRetryMs("Service unavailable, please try again later.");
+    expect(parsed.retryAfterMs).toBeUndefined();
+    const { duration, state } = computeQuarantine(parsed, undefined, 14_400_000, {
+      cooldownMs: 60_000,
+      quotaCooldownMs: 14_400_000,
+    });
+    expect(duration).toBe(14_400_000);
+    expect(state).toBe("quarantined");
+  });
+
+  test("computeQuarantine treats HTTP 426 Upgrade Required as a long quota block", () => {
+    const parsed = parseQuotaAndRetryMs("Upgrade Required");
+    const { duration, state } = computeQuarantine(parsed, 426, 120_000, {
+      cooldownMs: 60_000,
+      quotaCooldownMs: 14_400_000,
+    });
+    expect(duration).toBe(14_400_000);
+    expect(state).toBe("quota_exhausted");
   });
 
   test("/fb command always shows hydrated active session state even before first chat message", async () => {
@@ -52,22 +120,29 @@ describe("Model Fallback & Primary Agent Lock Plugin", () => {
     expect(cmdOut.parts[0].text).not.toContain("No active fallback state for current session");
   });
 
-  test("config sets true active model for primary agents when synthetic locking is disabled", async () => {
-    const hooks = await SmartFallbackPlugin({
-      client: {
-        tui: { showToast: async () => ({}) },
-        session: {
-          messages: async () => ({ data: [] }),
-          abort: async () => ({}),
-          revert: async () => ({}),
-          promptAsync: async () => ({}),
+  test("config sets true active model for primary agents pointing directly at head of fallback chain", async () => {
+    const hooks = await SmartFallbackPlugin(
+      {
+        client: {
+          tui: { showToast: async () => ({}) },
+          session: {
+            messages: async () => ({ data: [] }),
+            abort: async () => ({}),
+            revert: async () => ({}),
+            promptAsync: async () => ({}),
+          },
+        } as any,
+        project: {} as any,
+        directory: process.cwd(),
+        worktree: process.cwd(),
+        $: {} as any,
+      },
+      {
+        agents: {
+          plan: { chain: ["openrouter/anthropic/claude-sonnet-5.5"] },
         },
-      } as any,
-      project: {} as any,
-      directory: process.cwd(),
-      worktree: process.cwd(),
-      $: {} as any,
-    });
+      }
+    );
 
     const openCodeCfg: any = { agent: {}, provider: { google: { models: {} } } };
     await hooks.config!(openCodeCfg);
