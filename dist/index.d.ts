@@ -7,6 +7,7 @@ export { FallbackRouter } from "./router.js";
 export { CooldownStore } from "./store.js";
 export { parseModel, formatModel, normalizeChain } from "./models.js";
 export { isRetryableError, calculateCooldownTtl } from "./errors.js";
+export declare function resolveOptions(ctx: any, rawOptions?: SmartFallbackOptions): SmartFallbackOptions;
 export declare function createSmartFallbackRouter(ctx: any, rawOptions?: SmartFallbackOptions): {
     name: string;
     store: CooldownStore;

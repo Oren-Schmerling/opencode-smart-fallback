@@ -1,3 +1,6 @@
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Plugin } from "@opencode/plugin";
 import { calculateCooldownTtl, isRetryableError } from "./errors.js";
 import { formatModel, parseModel } from "./models.js";
@@ -8,8 +11,57 @@ export { FallbackRouter } from "./router.js";
 export { CooldownStore } from "./store.js";
 export { parseModel, formatModel, normalizeChain } from "./models.js";
 export { isRetryableError, calculateCooldownTtl } from "./errors.js";
+export function resolveOptions(ctx, rawOptions) {
+    if (rawOptions && (rawOptions.chains || rawOptions.agents)) {
+        return rawOptions;
+    }
+    const opts = ctx?.options ?? {};
+    if (opts.chains || opts.agents) {
+        return opts;
+    }
+    try {
+        const candidates = [
+            join(process.cwd(), ".opencode/model-fallback.json"),
+            join(homedir(), ".config/opencode/model-fallback.json"),
+        ];
+        for (const p of candidates) {
+            if (existsSync(p)) {
+                const raw = JSON.parse(readFileSync(p, "utf-8"));
+                const agents = {};
+                if (raw.agents && typeof raw.agents === "object") {
+                    for (const [k, v] of Object.entries(raw.agents)) {
+                        if (Array.isArray(v))
+                            agents[k] = v;
+                        else if (Array.isArray(v?.chain))
+                            agents[k] = v.chain;
+                    }
+                }
+                const chains = {};
+                if (raw.chains && typeof raw.chains === "object") {
+                    for (const [k, v] of Object.entries(raw.chains)) {
+                        if (Array.isArray(v))
+                            chains[k] = v;
+                        else if (typeof v === "string")
+                            chains[k] = [v];
+                    }
+                }
+                return {
+                    ...opts,
+                    chains: Object.keys(chains).length > 0 ? chains : opts.chains,
+                    agents: Object.keys(agents).length > 0 ? agents : opts.agents,
+                    cooldown_seconds: raw.defaults?.cooldownMs ? Math.round(raw.defaults.cooldownMs / 1000) : opts.cooldown_seconds,
+                    quota_cooldown_seconds: raw.defaults?.quotaCooldownMs ? Math.round(raw.defaults.quotaCooldownMs / 1000) : opts.quota_cooldown_seconds,
+                };
+            }
+        }
+    }
+    catch {
+        // Ignore config file read errors
+    }
+    return opts;
+}
 export function createSmartFallbackRouter(ctx, rawOptions) {
-    const options = (rawOptions ?? ctx.options ?? {});
+    const options = resolveOptions(ctx, rawOptions);
     const store = new CooldownStore(ctx.storage);
     const router = new FallbackRouter(options);
     const retryingSessions = new Set();

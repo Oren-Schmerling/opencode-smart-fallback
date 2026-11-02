@@ -50,6 +50,7 @@
   "devDependencies": {
     "@opencode/plugin": "^2.2.5",
     "@types/bun": "latest",
+    "@types/node": "^26.6.6",
     "typescript": "^5.7.0"
   },
   "publishConfig": {
