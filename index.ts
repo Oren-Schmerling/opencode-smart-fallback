@@ -321,11 +321,23 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
   mkdirSync(dirname(config.logPath), { recursive: true });
   mkdirSync(dirname(config.statePath), { recursive: true });
 
+  const getConfig = (): FallbackConfig => {
+    const file = loadConfig();
+    return {
+      ...file,
+      ...(options as any),
+      defaults: { ...file.defaults, ...((options as any)?.defaults ?? {}) },
+      primaryAgents: { ...file.primaryAgents, ...((options as any)?.primaryAgents ?? {}) },
+      agents: { ...file.agents, ...((options as any)?.agents ?? {}) },
+    };
+  };
+
   const syncHealthFromDisk = () => {
     if (!existsSync(config.statePath)) return;
     try {
       const data = JSON.parse(readFileSync(config.statePath, "utf8")) as Record<string, ModelHealthEntry>;
       const now = Date.now();
+      health.clear();
       for (const [k, v] of Object.entries(data)) {
         if (v.until > now) health.set(k, v);
       }
@@ -377,7 +389,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
   };
 
   const resolveFirstHealthyModel = (agentName?: string, currentModel?: string): string | null => {
-    const policy = normalizeAgentPolicy(config, agentName);
+    const policy = normalizeAgentPolicy(getConfig(), agentName);
     const chain = policy.chain;
     if (!chain.length) return null;
 
@@ -472,7 +484,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
     agentName?: string
   ) => {
     if (!modelKey || isSyntheticAgentModel(modelKey)) return;
-    const policy = normalizeAgentPolicy(config, agentName);
+    const policy = normalizeAgentPolicy(getConfig(), agentName);
     const now = Date.now();
     const prev = health.get(modelKey);
     const parsedQuota = parseQuotaAndRetryMs(reason);
@@ -513,7 +525,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
     agentName?: string,
     lastUserMessageID?: string
   ): Promise<boolean> => {
-    const policy = normalizeAgentPolicy(config, agentName);
+    const policy = normalizeAgentPolicy(getConfig(), agentName);
     if (policy.strategy === "continue") return true;
     if (policy.strategy === "revert") return false;
     try {
@@ -554,7 +566,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
     const currentModel = s.activeModel ?? resolveFirstHealthyModel(s.agent);
     if (!currentModel) return;
 
-    const policy = normalizeAgentPolicy(config, s.agent);
+    const policy = normalizeAgentPolicy(getConfig(), s.agent);
     const parsedQuota = parseQuotaAndRetryMs(reason);
 
     // Never defer fallback if the provider explicitly states daily/hard quota is exceeded
@@ -752,12 +764,12 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       return `### 📋 Recent Fallback Events (Last ${recent.length})\n| Time | Agent | Event | Transition | Strategy | Detail |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n${rows}`;
     }
 
-    const activePol = normalizeAgentPolicy(config, s.agent);
+    const activePol = normalizeAgentPolicy(getConfig(), s.agent);
     const resolvedNow = s.activeModel ?? resolveFirstHealthyModel(s.agent) ?? "none";
 
     const agentRows = Object.keys(config.agents)
       .map((agentKey) => {
-        const pol = normalizeAgentPolicy(config, agentKey);
+        const pol = normalizeAgentPolicy(getConfig(), agentKey);
         const modeLabel = config.primaryAgents[agentKey] ? "Primary" : "Subagent / Rule";
         const activeHead = resolveFirstHealthyModel(agentKey) ?? "_EXHAUSTED_";
         const marker = agentKey === s.agent ? "👉 " : "";
@@ -767,7 +779,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
 
     const allModels = new Set<string>();
     Object.keys(config.agents).forEach((a) =>
-      normalizeAgentPolicy(config, a).chain.forEach((m) => allModels.add(m))
+      normalizeAgentPolicy(getConfig(), a).chain.forEach((m) => allModels.add(m))
     );
     health.forEach((_, m) => allModels.add(m));
 
@@ -860,7 +872,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       }
 
       const isLegacySynthetic = isSyntheticAgentModel(requestedKey);
-      const policy = normalizeAgentPolicy(config, activeAgent);
+      const policy = normalizeAgentPolicy(getConfig(), activeAgent);
       const isNotInChain = Boolean(
         requestedKey && policy.chain.length > 0 && !policy.chain.includes(requestedKey)
       );
