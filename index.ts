@@ -908,26 +908,45 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         }
       }
 
-      if (event.type === "session.status") {
+      if (
+        event.type === "session.status" ||
+        event.type === "session.next.retried" ||
+        event.type === "session.retry.scheduled"
+      ) {
         const { sessionID, status } = event.properties ?? {};
         if (sessionID) getOrInitSession(sessionID);
-        if (sessionID && status?.type === "retry") {
-          const attempt = typeof status.attempt === "number" ? status.attempt : undefined;
-          const msg = status.message || "Provider retry triggered";
-          const codeMatch = msg.match(/\b(402|404|408|409|410|426|429|500|502|503|504|529)\b/);
-          const statusCode = codeMatch ? Number(codeMatch[1]) : undefined;
-          await triggerFallback(sessionID, msg, statusCode, attempt);
-        }
+        const attempt =
+          typeof status?.attempt === "number"
+            ? status.attempt
+            : typeof event.properties?.attempt === "number"
+            ? event.properties.attempt
+            : undefined;
+        const msg =
+          status?.message ||
+          event.properties?.error?.message ||
+          event.properties?.message ||
+          "Provider retry triggered";
+        const codeMatch = msg.match(/\b(402|404|408|409|410|426|429|500|502|503|504|529)\b/);
+        const statusCode = codeMatch ? Number(codeMatch[1]) : undefined;
+        await triggerFallback(sessionID, msg, statusCode, attempt);
       }
 
-      if (event.type === "session.error") {
-        const { sessionID, error } = event.properties ?? {};
-        if (!sessionID || !error) return;
-        const errName = error.name || "";
-        const errMsg = error.data?.message || error.message || JSON.stringify(error);
+      if (
+        event.type === "session.error" ||
+        event.type === "session.next.step.failed" ||
+        (event.type === "session.idle" && event.properties?.outcome === "failed")
+      ) {
+        const { sessionID } = event.properties ?? {};
+        if (!sessionID) return;
+        const errObj = event.properties?.error;
+        const errName = errObj?.name || "";
+        const errMsg =
+          errObj?.data?.message ||
+          errObj?.message ||
+          (typeof errObj === "string" ? errObj : JSON.stringify(errObj || "Session failed"));
         if (/abort|cancel/i.test(errName) || /abort|cancel/i.test(errMsg)) return;
 
-        const statusCode = error.data?.statusCode ?? error.statusCode;
+        const statusCode = errObj?.data?.statusCode ?? errObj?.statusCode;
         await triggerFallback(sessionID, errMsg, statusCode, undefined);
       }
     },
@@ -971,74 +990,166 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
 export const plugin = {
   id: "model-fallback",
   setup: async (ctx: any) => {
-    const hooks = await SmartFallbackPlugin(
-      {
-        client: (ctx.client ?? {
-          tui: { showToast: async () => ({}) },
-          session: {
-            messages: async (p: any) =>
-              ctx.session?.messages ? ctx.session.messages(p) : { data: [] },
-            abort: async (p: any) =>
-              ctx.session?.interrupt ? ctx.session.interrupt({ sessionID: p.path?.id }) : ({}),
-            revert: async (p: any) =>
-              ctx.session?.revert ? ctx.session.revert(p) : ({}),
-            promptAsync: async (p: any) =>
-              ctx.session?.prompt
-                ? ctx.session.prompt({ sessionID: p.path?.id, ...p.body })
-                : ({}),
-          },
-        }) as any,
-        project: (ctx.project ?? {}) as any,
-        directory: ctx.directory ?? process.cwd(),
-        worktree: ctx.worktree ?? process.cwd(),
-        experimental_workspace: (ctx.experimental_workspace ?? {}) as any,
-        serverUrl: ctx.serverUrl ?? new URL("http://localhost:4096"),
-        $: ctx.$ ?? ({} as any),
-      },
-      ctx.options
-    );
-
-    if (ctx.event?.subscribe && hooks.event) {
-      ctx.event.subscribe(async (event: any) => {
-        try {
-          await hooks.event?.({ event });
-        } catch {}
-      });
-    }
-
-    if (ctx.command?.transform && hooks["command.execute.before"]) {
-      await ctx.command.transform((editor: any) => {
-        editor.add({
-          name: "fb",
-          description: "Inspect or control model fallback health (status | tail | reset | quarantine)",
-          execute: async ({ sessionID, prompt }: any) => {
-            const output: any = { parts: [] };
-            await hooks["command.execute.before"]?.(
-              {
-                command: "fb",
-                arguments: prompt?.text || "",
-                sessionID,
+    let hooks: any;
+    try {
+      hooks = await SmartFallbackPlugin(
+        {
+          client: (ctx.client ?? {
+            tui: { showToast: async () => ({}) },
+            session: {
+              messages: async (p: any) =>
+                ctx.session?.messages ? ctx.session.messages(p) : { data: [] },
+              abort: async (p: any) => {
+                const sid = p.path?.id ?? p.sessionID;
+                if (ctx.session?.interrupt) {
+                  await ctx.session.interrupt({ sessionID: sid }).catch(() => {});
+                }
               },
-              output
-            );
-            if (output.parts?.length && ctx.session?.prompt) {
-              await ctx.session.prompt({
-                sessionID,
-                text: output.parts.map((p: any) => p.text).join("\n"),
-              });
-            }
-          },
-        });
-      });
+              revert: async (p: any) =>
+                ctx.session?.revert ? ctx.session.revert(p) : ({}),
+              switchModel: async (p: any) => {
+                const sid = p.path?.id ?? p.sessionID;
+                const m = p.body?.model ?? p.model;
+                if (ctx.session?.switchModel && m) {
+                  await ctx.session.switchModel({
+                    sessionID: sid,
+                    model: { providerID: m.providerID, id: m.modelID ?? m.id },
+                  }).catch(() => {});
+                }
+              },
+              promptAsync: async (p: any) => {
+                const sid = p.path?.id ?? p.sessionID;
+                const text =
+                  p.body?.parts?.find((part: any) => part.type === "text")?.text ||
+                  p.body?.text ||
+                  "Continue.";
+                if (p.body?.model && ctx.session?.switchModel) {
+                  await ctx.session
+                    .switchModel({
+                      sessionID: sid,
+                      model: {
+                        providerID: p.body.model.providerID,
+                        id: p.body.model.modelID ?? p.body.model.id,
+                      },
+                    })
+                    .catch(() => {});
+                }
+                if (ctx.session?.prompt) {
+                  return await ctx.session.prompt({
+                    sessionID: sid,
+                    text,
+                    ...(p.body?.agent ? { agents: [p.body.agent] } : {}),
+                  });
+                }
+              },
+            },
+          }) as any,
+          project: (ctx.project ?? {}) as any,
+          directory: ctx.directory ?? process.cwd(),
+          worktree: ctx.worktree ?? process.cwd(),
+          experimental_workspace: (ctx.experimental_workspace ?? {}) as any,
+          serverUrl: ctx.serverUrl ?? new URL("http://localhost:4096"),
+          $: ctx.$ ?? ({} as any),
+        },
+        ctx.options
+      );
+    } catch (e) {
+      console.error("[model-fallback] Failed to initialize plugin:", e);
+      return;
     }
 
+    // Subscribe to OpenCode v2 event stream
+    if (ctx.event?.subscribe && hooks.event) {
+      (async () => {
+        try {
+          const stream = ctx.event.subscribe();
+          if (stream && typeof stream[Symbol.asyncIterator] === "function") {
+            for await (const event of stream) {
+              try {
+                await hooks.event?.({ event });
+              } catch {}
+            }
+          }
+        } catch {}
+      })();
+    }
+
+    // Direct session retry hook
+    if (ctx.session?.hook) {
+      try {
+        await ctx.session.hook("retry", async (payload: any) => {
+          if (payload?.sessionID && payload?.error) {
+            const errMsg = payload.error?.message || String(payload.error);
+            const codeMatch = errMsg.match(/\b(402|404|408|409|410|426|429|500|502|503|504|529)\b/);
+            const statusCode =
+              payload.error?.statusCode ?? (codeMatch ? Number(codeMatch[1]) : undefined);
+            await hooks.event?.({
+              event: {
+                type: "session.status",
+                properties: {
+                  sessionID: payload.sessionID,
+                  status: {
+                    type: "retry",
+                    attempt: payload.attempt,
+                    message: errMsg,
+                  },
+                },
+              } as any,
+            });
+          }
+        });
+      } catch {}
+    }
+
+    // Register /fb command
+    if (ctx.command?.transform && hooks["command.execute.before"]) {
+      try {
+        await ctx.command.transform((editor: any) => {
+          editor.add({
+            name: "fb",
+            description:
+              "Inspect or control model fallback health (status | tail | reset | quarantine)",
+            execute: async ({ sessionID, prompt }: any) => {
+              const output: any = { parts: [] };
+              await hooks["command.execute.before"]?.(
+                {
+                  command: "fb",
+                  arguments: prompt?.text || "",
+                  sessionID,
+                },
+                output
+              );
+              if (output.parts?.length && ctx.session?.prompt) {
+                await ctx.session.prompt({
+                  sessionID,
+                  text: output.parts.map((p: any) => p.text).join("\n"),
+                });
+              }
+            },
+          });
+        });
+      } catch {}
+    }
+
+    // Register fallback_ctl tool with required name property
     if (ctx.tool?.transform && hooks.tool?.fallback_ctl) {
-      await ctx.tool.transform((editor: any) => {
-        editor.add(hooks.tool!.fallback_ctl);
-      });
+      try {
+        await ctx.tool.transform((editor: any) => {
+          editor.add({
+            id: "fallback_ctl",
+            name: "fallback_ctl",
+            description:
+              "Inspect or control the OpenCode model fallback router and per-agent chains (status, tail, reset, quarantine).",
+            parameters: hooks.tool!.fallback_ctl.parameters,
+            execute: (args: any, execCtx: any) =>
+              hooks.tool!.fallback_ctl.execute(args, execCtx),
+          });
+        });
+      } catch {}
     }
   },
   server: SmartFallbackPlugin,
 };
 
 export default plugin;
+
