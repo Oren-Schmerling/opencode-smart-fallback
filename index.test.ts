@@ -174,4 +174,31 @@ describe("Model Fallback Router Plugin", () => {
       modelID: "anthropic/claude-sonnet-5.5",
     });
   });
+
+  test("plugin default export satisfies OpenCode v2 schema with id and setup", async () => {
+    const { default: defaultExport, plugin } = await import("./index");
+    expect(defaultExport).toBeDefined();
+    expect(defaultExport.id).toBe("model-fallback");
+    expect(typeof defaultExport.setup).toBe("function");
+    expect(typeof defaultExport.server).toBe("function");
+    expect(plugin).toBe(defaultExport);
+
+    // Verify setup runs without errors when given a v2 ctx
+    const mockCtx: any = {
+      client: {
+        tui: { showToast: async () => ({}) },
+        session: {
+          messages: async () => ({ data: [] }),
+          abort: async () => ({}),
+          revert: async () => ({}),
+          promptAsync: async () => ({}),
+        },
+      },
+      event: { subscribe: (fn: any) => fn },
+      command: { transform: async (fn: any) => fn({ add: () => {} }) },
+      tool: { transform: async (fn: any) => fn({ add: () => {} }) },
+    };
+
+    await expect(defaultExport.setup(mockCtx)).resolves.toBeUndefined();
+  });
 });

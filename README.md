@@ -41,7 +41,7 @@ Because OpenCode executes plugins directly using Bun, you can point your configu
    {
      "$schema": "https://opencode.ai/config.json",
      "plugin": [
-       "file:///home/<your-user>/.config/opencode/plugins/model-fallback/index.ts"
+       "file:///home/<your-user>/.config/opencode/plugins/model-fallback"
      ],
      "command": {
        "fb": {

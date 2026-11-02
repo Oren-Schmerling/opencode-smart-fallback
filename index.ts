@@ -968,7 +968,77 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
   };
 };
 
-export default {
+export const plugin = {
   id: "model-fallback",
+  setup: async (ctx: any) => {
+    const hooks = await SmartFallbackPlugin(
+      {
+        client: (ctx.client ?? {
+          tui: { showToast: async () => ({}) },
+          session: {
+            messages: async (p: any) =>
+              ctx.session?.messages ? ctx.session.messages(p) : { data: [] },
+            abort: async (p: any) =>
+              ctx.session?.interrupt ? ctx.session.interrupt({ sessionID: p.path?.id }) : ({}),
+            revert: async (p: any) =>
+              ctx.session?.revert ? ctx.session.revert(p) : ({}),
+            promptAsync: async (p: any) =>
+              ctx.session?.prompt
+                ? ctx.session.prompt({ sessionID: p.path?.id, ...p.body })
+                : ({}),
+          },
+        }) as any,
+        project: (ctx.project ?? {}) as any,
+        directory: ctx.directory ?? process.cwd(),
+        worktree: ctx.worktree ?? process.cwd(),
+        experimental_workspace: (ctx.experimental_workspace ?? {}) as any,
+        serverUrl: ctx.serverUrl ?? new URL("http://localhost:4096"),
+        $: ctx.$ ?? ({} as any),
+      },
+      ctx.options
+    );
+
+    if (ctx.event?.subscribe && hooks.event) {
+      ctx.event.subscribe(async (event: any) => {
+        try {
+          await hooks.event?.({ event });
+        } catch {}
+      });
+    }
+
+    if (ctx.command?.transform && hooks["command.execute.before"]) {
+      await ctx.command.transform((editor: any) => {
+        editor.add({
+          name: "fb",
+          description: "Inspect or control model fallback health (status | tail | reset | quarantine)",
+          execute: async ({ sessionID, prompt }: any) => {
+            const output: any = { parts: [] };
+            await hooks["command.execute.before"]?.(
+              {
+                command: "fb",
+                arguments: prompt?.text || "",
+                sessionID,
+              },
+              output
+            );
+            if (output.parts?.length && ctx.session?.prompt) {
+              await ctx.session.prompt({
+                sessionID,
+                text: output.parts.map((p: any) => p.text).join("\n"),
+              });
+            }
+          },
+        });
+      });
+    }
+
+    if (ctx.tool?.transform && hooks.tool?.fallback_ctl) {
+      await ctx.tool.transform((editor: any) => {
+        editor.add(hooks.tool!.fallback_ctl);
+      });
+    }
+  },
   server: SmartFallbackPlugin,
 };
+
+export default plugin;
