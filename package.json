@@ -1,11 +1,25 @@
 {
   "name": "opencode-smart-fallback",
-  "version": "1.0.0",
-  "description": "An advanced, zero-build model fallback router and primary agent manager for OpenCode.",
-  "main": "index.ts",
+  "version": "2.0.0",
+  "description": "Production-grade OpenCode V2 plugin for multi-hop free-tier model waterfalls, per-agent chains, tiered cooldowns, and zero-cancellation subagent failover.",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "bun test index.test.ts"
+    "build": "tsc",
+    "test": "bun test",
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "opencode",
@@ -17,10 +31,8 @@
     "rate-limit",
     "failover",
     "model-routing",
-    "router",
-    "llm",
-    "bun",
-    "typescript"
+    "waterfall",
+    "llm"
   ],
   "author": "Oren Schmerling",
   "license": "MIT",
@@ -33,10 +45,14 @@
     "url": "https://github.com/Oren-Schmerling/opencode-smart-fallback/issues"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.19.4"
+    "@opencode/plugin": ">=2.0.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.19.4",
-    "@types/bun": "latest"
+    "@opencode/plugin": "^2.2.5",
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
