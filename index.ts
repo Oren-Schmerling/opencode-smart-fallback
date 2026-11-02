@@ -181,12 +181,17 @@ export function normalizeAgentPolicy(
   };
 }
 
-export function splitModelKey(key: string): { providerID: string; modelID: string } | null {
+export function splitModelKey(
+  key: string
+): { providerID: string; modelID: string; id: string } | null {
   if (!MODEL_KEY_REGEX.test(key)) return null;
   const idx = key.indexOf("/");
+  const providerID = key.slice(0, idx);
+  const modelID = key.slice(idx + 1);
   return {
-    providerID: key.slice(0, idx),
-    modelID: key.slice(idx + 1),
+    providerID,
+    modelID,
+    id: modelID,
   };
 }
 
@@ -470,8 +475,8 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         }
       } catch {}
     }
-    if (!s.activeModel || !isUsable(s.activeModel)) {
-      s.activeModel = resolveFirstHealthyModel(s.agent) ?? s.activeModel;
+    if (!s.activeModel) {
+      s.activeModel = resolveFirstHealthyModel(s.agent) ?? undefined;
     }
     return s;
   };
@@ -598,20 +603,6 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       quarantineModel(currentModel, reason, statusCode, undefined, s.agent);
 
       const isSubagent = s.isSubagent || Boolean(s.parentID) || !config.primaryAgents[s.agent];
-      if (isSubagent) {
-        log({
-          event: "fallback.subagent.quarantined",
-          sessionID,
-          agent: s.agent,
-          from: currentModel,
-          detail: "Quarantined model for subagent without aborting/replaying child session",
-        });
-        await toast(
-          `⚠️ [Subagent: ${s.agent}] Model ${currentModel.split("/").pop()} failed. Quarantined for fallback.`,
-          "warning"
-        );
-        return;
-      }
 
       if (s.depth >= config.defaults.maxFallbackDepth) {
         log({
@@ -622,7 +613,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           detail: "Max depth reached",
         });
         await withTimeout(
-          client.session.abort({ path: { id: sessionID } }),
+          client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
           config.defaults.abortTimeoutMs,
           "abort"
         ).catch(() => {});
@@ -650,7 +641,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         });
 
         log({
-          event: "fallback.reactive",
+          event: isSubagent ? "fallback.subagent.route" : "fallback.reactive",
           sessionID,
           agent: s.agent,
           from: currentModel,
@@ -660,25 +651,42 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         });
 
         await toast(
-          `🔀 [${s.agent} ${s.depth}/${config.defaults.maxFallbackDepth}] ${currentModel.split("/").pop()} → ${nextModel.split("/").pop()} (${strategyUsed})`,
+          `🔀 [${isSubagent ? "Subagent: " : ""}${s.agent} ${s.depth}/${config.defaults.maxFallbackDepth}] ${currentModel.split("/").pop()} → ${nextModel.split("/").pop()} (${strategyUsed})`,
           "warning"
         );
 
         try {
-          await withTimeout(
-            client.session.abort({ path: { id: sessionID } }),
-            config.defaults.abortTimeoutMs,
-            "abort"
-          ).catch(() => {});
-
-          if (!midTurn && s.lastUserMessageID) {
+          if (!isSubagent) {
             await withTimeout(
-              client.session.revert({
-                path: { id: sessionID },
-                body: { messageID: s.lastUserMessageID },
+              client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
+              config.defaults.abortTimeoutMs,
+              "abort"
+            ).catch(() => {});
+
+            if (!midTurn && s.lastUserMessageID) {
+              await withTimeout(
+                client.session.revert({
+                  path: { sessionID, id: sessionID },
+                  sessionID,
+                  body: { messageID: s.lastUserMessageID },
+                  messageID: s.lastUserMessageID,
+                }),
+                config.defaults.revertTimeoutMs,
+                "revert"
+              ).catch(() => {});
+            }
+          }
+
+          if (client.session?.switchModel) {
+            await withTimeout(
+              client.session.switchModel({
+                path: { sessionID, id: sessionID },
+                sessionID,
+                body: { model: parsed },
+                model: parsed,
               }),
-              config.defaults.revertTimeoutMs,
-              "revert"
+              config.defaults.abortTimeoutMs,
+              "switchModel"
             ).catch(() => {});
           }
 
@@ -688,10 +696,13 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
 
           await withTimeout(
             client.session.promptAsync({
-              path: { id: sessionID },
+              path: { sessionID, id: sessionID },
+              sessionID,
               body: {
                 ...(s.agent ? { agent: s.agent } : {}),
+                agent: s.agent,
                 model: parsed,
+                text: replayText,
                 parts: [{ type: "text", text: replayText }],
               },
             }),
@@ -700,20 +711,30 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           );
           return;
         } catch (replayErr: any) {
-          quarantineModel(
-            nextModel,
-            `Replay failed: ${replayErr?.message ?? "unknown"}`,
-            undefined,
-            undefined,
-            s.agent
-          );
+          const errMsg = replayErr?.message || String(replayErr);
+          log({
+            event: "fallback.replay.failed",
+            sessionID,
+            agent: s.agent,
+            target: nextModel,
+            error: errMsg,
+          });
+          if (/(?:quota|rate.?limit|402|404|410|426|429|500|502|503|504|529)/i.test(errMsg)) {
+            quarantineModel(
+              nextModel,
+              `Replay failed: ${errMsg}`,
+              undefined,
+              undefined,
+              s.agent
+            );
+          }
           nextModel = resolveFirstHealthyModel(s.agent, nextModel);
         }
       }
 
       log({ event: "fallback.exhausted.chain", sessionID, agent: s.agent, from: currentModel });
       await withTimeout(
-        client.session.abort({ path: { id: sessionID } }),
+        client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
         config.defaults.abortTimeoutMs,
         "abort-exhausted"
       ).catch(() => {});
@@ -922,6 +943,38 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
             s.isSubagent = true;
           }
           if (info?.agent) s.agent = info.agent;
+
+          const currentModel =
+            s.activeModel ??
+            (info?.model?.providerID && (info?.model?.modelID || info?.model?.id)
+              ? `${info.model.providerID}/${info.model.modelID ?? info.model.id}`
+              : resolveFirstHealthyModel(s.agent));
+          if (currentModel && !isUsable(currentModel)) {
+            const target = resolveFirstHealthyModel(s.agent, currentModel);
+            if (target) {
+              const parsed = splitModelKey(target);
+              if (parsed) {
+                s.activeModel = target;
+                if (client?.session?.switchModel) {
+                  await client.session
+                    .switchModel({
+                      path: { sessionID: sid, id: sid },
+                      sessionID: sid,
+                      body: { model: parsed },
+                      model: parsed,
+                    })
+                    .catch(() => {});
+                }
+                log({
+                  event: "session.create.route",
+                  sessionID: sid,
+                  agent: s.agent,
+                  from: currentModel,
+                  to: target,
+                });
+              }
+            }
+          }
         }
       }
 
@@ -1012,8 +1065,10 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       if (client?.session?.switchModel && sid) {
         await client.session
           .switchModel({
+            path: { sessionID: sid, id: sid },
             sessionID: sid,
-            model: { providerID: parsed.providerID, id: parsed.modelID },
+            body: { model: parsed },
+            model: parsed,
           })
           .catch(() => {});
       }
@@ -1052,74 +1107,103 @@ export const plugin = {
     try {
       hooks = await (plugin.server ?? SmartFallbackPlugin)(
         {
-          client: (ctx.client ?? {
-            tui: { showToast: async () => ({}) },
+          client: {
+            tui: ctx.client?.tui ?? { showToast: async () => ({}) },
             session: {
               messages: async (p: any) => {
-                const sid = p.path?.id ?? p.sessionID;
+                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
                 if (ctx.session?.context) {
                   const res = await ctx.session.context({ sessionID: sid }).catch(() => null);
                   if (res?.data) return res;
                   if (Array.isArray(res)) return { data: res };
                 }
-                return ctx.session?.messages ? ctx.session.messages(p) : { data: [] };
+                if (ctx.client?.session?.messages) {
+                  return await ctx.client.session.messages({ path: { sessionID: sid, id: sid } }).catch(() => ({ data: [] }));
+                }
+                if (ctx.client?.session?.message?.list) {
+                  return await ctx.client.session.message.list({ path: { sessionID: sid } }).catch(() => ({ data: [] }));
+                }
+                return { data: [] };
               },
               abort: async (p: any) => {
-                const sid = p.path?.id ?? p.sessionID;
+                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
                 if (ctx.session?.interrupt) {
                   await ctx.session.interrupt({ sessionID: sid }).catch(() => {});
                 }
+                if (ctx.client?.session?.interrupt) {
+                  await ctx.client.session.interrupt({ path: { sessionID: sid } }).catch(() => {});
+                } else if (ctx.client?.session?.abort) {
+                  await ctx.client.session.abort({ path: { sessionID: sid, id: sid } }).catch(() => {});
+                }
               },
-              revert: async (p: any) =>
-                ctx.session?.revert ? ctx.session.revert(p) : ({}),
+              revert: async (p: any) => {
+                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
+                const messageID = p.body?.messageID ?? p.messageID;
+                if (ctx.session?.revert) {
+                  return await ctx.session.revert({ sessionID: sid, messageID }).catch(() => ({}));
+                }
+                if (ctx.client?.session?.revert?.stage) {
+                  return await ctx.client.session.revert.stage({ path: { sessionID: sid }, body: { messageID } }).catch(() => ({}));
+                }
+                return {};
+              },
               switchAgent: async (p: any) => {
-                const sid = p.path?.id ?? p.sessionID;
+                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
                 const agent = p.body?.agent ?? p.agent;
                 if (ctx.session?.switchAgent && agent) {
                   await ctx.session.switchAgent({ sessionID: sid, agent }).catch(() => {});
                 }
+                if (ctx.client?.session?.switchAgent && agent) {
+                  await ctx.client.session.switchAgent({ path: { sessionID: sid }, body: { agent } }).catch(() => {});
+                }
               },
               switchModel: async (p: any) => {
-                const sid = p.path?.id ?? p.sessionID;
+                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
                 const m = p.body?.model ?? p.model;
-                if (ctx.session?.switchModel && m) {
-                  await ctx.session.switchModel({
-                    sessionID: sid,
-                    model: { providerID: m.providerID, id: m.modelID ?? m.id },
-                  }).catch(() => {});
+                if (!m) return;
+                const parsed = { providerID: m.providerID, id: m.id ?? m.modelID };
+                if (ctx.session?.switchModel) {
+                  await ctx.session.switchModel({ sessionID: sid, model: parsed }).catch(() => {});
+                }
+                if (ctx.client?.session?.switchModel) {
+                  await ctx.client.session.switchModel({ path: { sessionID: sid }, body: { model: parsed } }).catch(() => {});
                 }
               },
               promptAsync: async (p: any) => {
-                const sid = p.path?.id ?? p.sessionID;
+                const sid = p.path?.sessionID ?? p.path?.id ?? p.sessionID;
                 const text =
-                  p.body?.parts?.find((part: any) => part.type === "text")?.text ||
-                  p.body?.text ||
+                  p.body?.text ??
+                  p.text ??
+                  p.body?.parts?.find((part: any) => part.type === "text")?.text ??
                   "Continue.";
-                if (p.body?.agent && ctx.session?.switchAgent) {
-                  await ctx.session
-                    .switchAgent({ sessionID: sid, agent: p.body.agent })
-                    .catch(() => {});
+                const agent = p.body?.agent ?? p.agent;
+                if (agent) {
+                  if (ctx.session?.switchAgent) {
+                    await ctx.session.switchAgent({ sessionID: sid, agent }).catch(() => {});
+                  }
+                  if (ctx.client?.session?.switchAgent) {
+                    await ctx.client.session.switchAgent({ path: { sessionID: sid }, body: { agent } }).catch(() => {});
+                  }
                 }
-                if (p.body?.model && ctx.session?.switchModel) {
-                  await ctx.session
-                    .switchModel({
-                      sessionID: sid,
-                      model: {
-                        providerID: p.body.model.providerID,
-                        id: p.body.model.modelID ?? p.body.model.id,
-                      },
-                    })
-                    .catch(() => {});
+                const m = p.body?.model ?? p.model;
+                if (m) {
+                  const parsed = { providerID: m.providerID, id: m.id ?? m.modelID };
+                  if (ctx.session?.switchModel) {
+                    await ctx.session.switchModel({ sessionID: sid, model: parsed }).catch(() => {});
+                  }
+                  if (ctx.client?.session?.switchModel) {
+                    await ctx.client.session.switchModel({ path: { sessionID: sid }, body: { model: parsed } }).catch(() => {});
+                  }
                 }
                 if (ctx.session?.prompt) {
-                  return await ctx.session.prompt({
-                    sessionID: sid,
-                    text,
-                  });
+                  return await ctx.session.prompt({ sessionID: sid, text });
+                }
+                if (ctx.client?.session?.prompt) {
+                  return await ctx.client.session.prompt({ path: { sessionID: sid }, body: { text } });
                 }
               },
             },
-          }) as any,
+          } as any,
           project: (ctx.project ?? {}) as any,
           directory: ctx.directory ?? process.cwd(),
           worktree: ctx.worktree ?? process.cwd(),

@@ -249,4 +249,101 @@ describe("Model Fallback Router Plugin", () => {
     // Restore server
     (defaultExport as any).server = origServer;
   });
+
+  test("subagent session falls back to next model and replays prompt on quota error", async () => {
+    let switchedModel: any;
+    let prompted: any;
+
+    const hooks = await SmartFallbackPlugin(
+      {
+        client: {
+          tui: { showToast: async () => ({}) },
+          session: {
+            messages: async () => ({
+              data: [
+                {
+                  id: "msg-user",
+                  type: "user",
+                  text: "Inspect the repo and run checks",
+                },
+                {
+                  id: "msg-assistant",
+                  type: "assistant",
+                  agent: "scout",
+                  model: { providerID: "google", id: "gemini-flash-lite-latest" },
+                  finish: "error",
+                },
+              ],
+            }),
+            abort: async () => ({}),
+            revert: async () => ({}),
+            switchModel: async (args: any) => {
+              switchedModel = args;
+            },
+            promptAsync: async (args: any) => {
+              prompted = args;
+            },
+          },
+        } as any,
+        project: {} as any,
+        directory: process.cwd(),
+        worktree: process.cwd(),
+        $: {} as any,
+      },
+      {
+        agents: {
+          scout: {
+            strategy: "continue",
+            retriesBeforeFallback: 0,
+            chain: [
+              "google/gemini-flash-lite-latest",
+              "openrouter/openrouter/free",
+            ],
+          },
+        },
+      }
+    );
+
+    // Register subagent session
+    await hooks.event!({
+      event: {
+        type: "session.created",
+        properties: {
+          info: {
+            id: "sub-ses-1",
+            agent: "scout",
+            parentID: "parent-build-ses",
+          },
+        },
+      },
+    });
+
+    // Subagent step fails with Gemini free tier quota limit
+    await hooks.event!({
+      event: {
+        type: "session.error",
+        properties: {
+          sessionID: "sub-ses-1",
+          error: {
+            name: "AI.Error.QuotaExceeded",
+            message:
+              "Generate content requests per minute limit exceeded on Free Tier. Please retry in 31s.",
+            statusCode: 429,
+          },
+        },
+      },
+    });
+
+    // Subagent should NOT be abandoned with an early return; it must switch to openrouter/free and prompt
+    expect(switchedModel).toBeDefined();
+    expect(switchedModel.body?.model ?? switchedModel.model).toEqual(
+      expect.objectContaining({
+        providerID: "openrouter",
+        id: "openrouter/free",
+        modelID: "openrouter/free",
+      })
+    );
+    expect(prompted).toBeDefined();
+    expect(prompted.sessionID).toBe("sub-ses-1");
+  });
 });
