@@ -475,9 +475,10 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           if (info?.agent) {
             s.agent = info.agent;
           }
-          if (info?.model?.providerID && (info?.model?.modelID || info?.model?.id)) {
-            const mid = info.model.modelID ?? info.model.id;
-            const fullKey = `${info.model.providerID}/${mid}`;
+          const providerID = info?.providerID ?? info?.model?.providerID;
+          const modelID = info?.modelID ?? info?.model?.modelID ?? info?.model?.id;
+          if (providerID && modelID) {
+            const fullKey = `${providerID}/${modelID}`;
             const lockedAgent = extractAgentFromSyntheticModel(fullKey);
             if (lockedAgent) {
               s.agent = lockedAgent;
@@ -626,7 +627,20 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
     const myEpoch = ++s.epoch;
 
     try {
-      quarantineModel(currentModel, reason, statusCode, undefined, s.agent);
+      let modelToQuarantine = currentModel;
+      if (/ai\.google\.dev|generativelanguage\.googleapis\.com|Google Generative AI/i.test(reason)) {
+        if (!modelToQuarantine.startsWith("google/")) {
+          const googleCandidate = policy.chain.find((m) => m.startsWith("google/"));
+          if (googleCandidate) modelToQuarantine = googleCandidate;
+        }
+      } else if (/openrouter\.ai/i.test(reason)) {
+        if (!modelToQuarantine.startsWith("openrouter/")) {
+          const openrouterCandidate = policy.chain.find((m) => m.startsWith("openrouter/"));
+          if (openrouterCandidate) modelToQuarantine = openrouterCandidate;
+        }
+      }
+
+      quarantineModel(modelToQuarantine, reason, statusCode, undefined, s.agent);
 
       const isSubagent = s.isSubagent || Boolean(s.parentID) || !config.primaryAgents[s.agent];
 
@@ -638,12 +652,14 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
           from: currentModel,
           detail: "Max depth reached",
         });
-        await withTimeout(
-          client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
-          config.defaults.abortTimeoutMs,
-          "abort"
-        ).catch(() => {});
-        await toast(`🛑 Max fallback depth (${s.depth}) reached. Session aborted.`, "error");
+        if (!isSubagent) {
+          await withTimeout(
+            client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
+            config.defaults.abortTimeoutMs,
+            "abort"
+          ).catch(() => {});
+        }
+        await toast(`🛑 Max fallback depth (${s.depth}) reached for "${s.agent}".`, "error");
         return;
       }
 
@@ -725,8 +741,7 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
               path: { sessionID, id: sessionID },
               sessionID,
               body: {
-                ...(s.agent ? { agent: s.agent } : {}),
-                agent: s.agent,
+                ...(!isSubagent && s.agent ? { agent: s.agent } : {}),
                 model: parsed,
                 text: replayText,
                 parts: [{ type: "text", text: replayText }],
@@ -759,12 +774,14 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
       }
 
       log({ event: "fallback.exhausted.chain", sessionID, agent: s.agent, from: currentModel });
-      await withTimeout(
-        client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
-        config.defaults.abortTimeoutMs,
-        "abort-exhausted"
-      ).catch(() => {});
-      await toast(`🛑 Fallback chain exhausted for agent "${s.agent}". Aborted.`, "error");
+      if (!isSubagent) {
+        await withTimeout(
+          client.session.abort({ path: { sessionID, id: sessionID }, sessionID }),
+          config.defaults.abortTimeoutMs,
+          "abort-exhausted"
+        ).catch(() => {});
+      }
+      await toast(`🛑 Fallback chain exhausted for agent "${s.agent}".`, "error");
     } finally {
       if (s.epoch === myEpoch) {
         s.recovering = false;
@@ -1094,6 +1111,33 @@ export const SmartFallbackPlugin: Plugin = async ({ client }, options) => {
         });
       }
     },
+
+    "tool.execute.before": async (input: any, output: any) => {
+      if (!config.enabled) return;
+      if (input.tool === "subagent" || input.tool === "task") {
+        const args = output?.args;
+        if (!args) return;
+        const targetAgent = args.agent ?? args.subagent;
+        if (targetAgent) {
+          const policy = normalizeAgentPolicy(getConfig(), targetAgent);
+          const firstConfigured = policy.chain[0];
+          if (firstConfigured && !isUsable(firstConfigured)) {
+            const healthy = resolveFirstHealthyModel(targetAgent, firstConfigured);
+            if (healthy) {
+              args.model = healthy;
+              log({
+                event: "subagent.preemptive.model",
+                sessionID: input.sessionID,
+                agent: targetAgent,
+                from: firstConfigured,
+                to: healthy,
+              });
+            }
+          }
+        }
+      }
+    },
+
 
     "session.generate": async (payload: any) => {
       if (!config.enabled || !payload?.model) return;

@@ -345,6 +345,13 @@ describe("Model Fallback Router Plugin", () => {
     );
     expect(prompted).toBeDefined();
     expect(prompted.sessionID).toBe("sub-ses-1");
+    expect(prompted.body?.agent).toBeUndefined();
+
+    // Preemptive tool argument rewriting for subagent invocation
+    const toolExecInput = { tool: "subagent", sessionID: "parent-build-ses" };
+    const toolExecOutput = { args: { agent: "scout" } };
+    await hooks["tool.execute.before"]!(toolExecInput, toolExecOutput);
+    expect((toolExecOutput.args as any).model).toBe("openrouter/openrouter/free");
 
     // A brand new subagent session created after Gemini is quarantined must be
     // preemptively routed to openrouter/free before its first request
